@@ -434,16 +434,49 @@ function falsy(): Step[] {
 }
 
 function graphql(state: VState): Step[] {
+  const sync = state.mode === 'sync';
   const result = '{ id: 1, title: "…" }';
-  const head = [...setupFrames(), ...traceHead('graphql resolves a field')];
-  if (state.mode === 'sync') {
+  const head: Step[] = [
+    ...setupFrames(),
+    {
+      depth: 0, kind: 'call', title: 'graphql resolves a field',
+      detail: 'graphql-js wraps every resolver in one traceMixed helper.',
+      caption: 'Caller context is still active.',
+      hl: [10], store: 'request', ctx: ctxBase(), trace: tBefore(), tone: 'normal',
+    },
+    {
+      depth: 1, kind: 'run', title: 'channel.start.runStores(ctx, fn)',
+      detail: 'traceMixed publishes `start` and enters the bound store for fn.',
+      caption: 'About to run the producer and enter its store.',
+      hl: [11], store: 'request', ctx: ctxBase(), trace: tBefore(), tone: 'normal',
+    },
+    {
+      depth: 2, kind: 'transform', title: 'transform(ctx)',
+      detail: 'Our producer clones the scope and plants db.query on it.',
+      caption: 'Producer plants db.query on a cloned scope.',
+      hl: [4, 5, 6], store: 'request', ctx: ctxTransformed(), trace: tBefore(), tone: 'normal',
+    },
+    {
+      depth: 2, kind: 'run', title: 'als.run(spanStore, fn)',
+      detail: 'fn (the resolver) runs inside our span store.',
+      caption: 'Span store entered; db.query active.',
+      hl: [11], store: 'span', ctx: ctxTransformed(), trace: tSpan(), tone: 'good',
+    },
+    {
+      depth: 3, kind: 'event', channel: 'start', title: 'start',
+      detail: 'start fires; getActiveSpan() === db.query.',
+      caption: 'db.query is active for the resolver.',
+      hl: [11], store: 'span', ctx: ctxTransformed(), trace: tSpan(), tone: 'event',
+    },
+  ];
+  if (sync) {
     return [
       ...head,
       {
         depth: 3, kind: 'event', channel: 'end', title: 'end',
-        detail: 'Resolver returned a plain value, so the library publishes `end`. result is present → span.end().',
-        caption: 'Sync resolver → the library publishes end. span.end() now.',
-        hl: [20], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
+        detail: 'Resolver returned a value (not a thenable): result is set, then end fires. \'result\' in data → span.end().',
+        caption: 'Sync resolver: result present at end → span.end() now.',
+        hl: [19, 20], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
       },
       exitFrame(),
     ];
@@ -451,16 +484,22 @@ function graphql(state: VState): Step[] {
   return [
     ...head,
     {
+      depth: 3, kind: 'event', channel: 'end', title: 'end',
+      detail: 'Resolver returned a promise. traceMixed publishes `end` NOW, before it settles, so neither result nor error is present → NO-OP.',
+      caption: 'Async resolver: end fires early with NO result → NO-OP. Same channel, different shape.',
+      hl: [23], store: 'span', ctx: ctxTransformed(), trace: tSpan(), tone: 'event',
+    },
+    {
       depth: 3, kind: 'event', channel: 'asyncStart', title: 'asyncStart',
-      detail: 'Resolver returned a thenable, so the library attaches `.then` and publishes asyncStart. No `end` is published on this path.',
-      caption: 'Async resolver → asyncStart on .then. No end fires. Same channel, different shape.',
-      hl: [15], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tSpan(), tone: 'event',
+      detail: 'The resolver promise resolved; asyncStart fires (with the result now attached).',
+      caption: 'asyncStart: nothing to do.',
+      hl: [26], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tSpan(), tone: 'event',
     },
     {
       depth: 3, kind: 'event', channel: 'asyncEnd', title: 'asyncEnd',
       detail: 'asyncEnd → span.end().',
       caption: 'asyncEnd → span.end().',
-      hl: [16], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
+      hl: [27], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
     },
     exitFrame(),
   ];
@@ -535,24 +574,33 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     id: 'graphql', label: 'sync-or-async',
-    blurb: 'The GraphQL caveat: the resolve channel runs the resolver via runStores, then branches on the return value. A sync resolver publishes `end`; an async one publishes asyncStart/asyncEnd on `.then`. Same channel, two shapes, you cannot assume.',
+    blurb: 'The GraphQL caveat: graphql-js wraps every resolver in one `traceMixed` helper. It publishes `end` for BOTH sync and async resolvers, but for async, `end` fires early with no result. So you cannot pair start/asyncEnd; the `\'result\' in data` check at `end` is what tells them apart.',
     variants: [
       { key: 'mode', label: 'resolver', options: [{ value: 'async', label: 'async resolver' }, { value: 'sync', label: 'sync resolver' }] },
     ],
     code: () => [
       ...WIRE,
-      'const out = channel.start.runStores(ctx,',
-      '  () => resolve(source, args))',
-      '',
-      'if (isThenable(out)) {              // async',
-      '  out.then(v => {',
-      '    ctx.result = v',
-      '    channel.asyncStart.publish(ctx)',
-      '    channel.asyncEnd.publish(ctx)',
+      '// graphql-js internal (src/diagnostics.ts):',
+      'function traceMixed(channel, ctx, fn) {',
+      '  return channel.start.runStores(ctx, () => {',
+      '    let result',
+      '    try { result = fn() } catch (err) {',
+      '      ctx.error = err',
+      '      channel.error.publish(ctx)',
+      '      channel.end.publish(ctx); throw err',
+      '    }',
+      '    if (!isPromiseLike(result)) {        // sync',
+      '      ctx.result = result',
+      '      channel.end.publish(ctx)',
+      '      return result',
+      '    }',
+      '    channel.end.publish(ctx)             // async: end before settle',
+      '    return result.then(v => {',
+      '      ctx.result = v',
+      '      channel.asyncStart.publish(ctx)',
+      '      channel.asyncEnd.publish(ctx)',
+      '    })',
       '  })',
-      '} else {                           // sync',
-      '  ctx.result = out',
-      '  channel.end.publish(ctx)',
       '}',
     ],
     build: graphql,
