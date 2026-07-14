@@ -434,16 +434,16 @@ function falsy(): Step[] {
 }
 
 function graphql(state: VState): Step[] {
-  const head = [...setupFrames(), ...traceHead('channel.trace(() => resolve(...), ctx)')];
+  const result = '{ id: 1, title: "…" }';
+  const head = [...setupFrames(), ...traceHead('graphql resolves a field')];
   if (state.mode === 'sync') {
-    const c: Ctx = { ...ctxTransformed(), result: '{ id: 1, title: "…" }' };
     return [
       ...head,
       {
         depth: 3, kind: 'event', channel: 'end', title: 'end',
-        detail: 'Sync resolver: result is present at end → span.end() now, no async events.',
-        caption: 'Sync resolver: result present at end → end now.',
-        hl: [9], store: 'span', ctx: c, trace: tDone(), tone: 'event',
+        detail: 'Resolver returned a plain value, so the library publishes `end`. result is present → span.end().',
+        caption: 'Sync resolver → the library publishes end. span.end() now.',
+        hl: [20], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
       },
       exitFrame(),
     ];
@@ -451,22 +451,16 @@ function graphql(state: VState): Step[] {
   return [
     ...head,
     {
-      depth: 3, kind: 'event', channel: 'end', title: 'end',
-      detail: 'Async resolver: no result at end → NO-OP, wait for asyncEnd.',
-      caption: 'Async resolver: nothing at end → NO-OP. Same channel, different lifecycle.',
-      hl: [9], store: 'span', ctx: ctxTransformed(), trace: tSpan(), tone: 'event',
-    },
-    {
       depth: 3, kind: 'event', channel: 'asyncStart', title: 'asyncStart',
-      detail: 'Resolver promise resolved.',
-      caption: 'asyncStart: nothing to do.',
-      hl: [9], store: 'span', ctx: { ...ctxTransformed(), result: '{ id: 1, title: "…" }' }, trace: tSpan(), tone: 'event',
+      detail: 'Resolver returned a thenable, so the library attaches `.then` and publishes asyncStart. No `end` is published on this path.',
+      caption: 'Async resolver → asyncStart on .then. No end fires. Same channel, different shape.',
+      hl: [15], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tSpan(), tone: 'event',
     },
     {
       depth: 3, kind: 'event', channel: 'asyncEnd', title: 'asyncEnd',
       detail: 'asyncEnd → span.end().',
       caption: 'asyncEnd → span.end().',
-      hl: [9], store: 'span', ctx: { ...ctxTransformed(), result: '{ id: 1, title: "…" }' }, trace: tDone(), tone: 'event',
+      hl: [16], store: 'span', ctx: { ...ctxTransformed(), result }, trace: tDone(), tone: 'event',
     },
     exitFrame(),
   ];
@@ -541,11 +535,26 @@ export const SCENARIOS: Scenario[] = [
   },
   {
     id: 'graphql', label: 'sync-or-async',
-    blurb: 'The GraphQL caveat: one `resolve` channel traces sync AND async resolvers. You cannot assume the lifecycle, the `end` discriminator handles both.',
+    blurb: 'The GraphQL caveat: the resolve channel runs the resolver via runStores, then branches on the return value. A sync resolver publishes `end`; an async one publishes asyncStart/asyncEnd on `.then`. Same channel, two shapes, you cannot assume.',
     variants: [
       { key: 'mode', label: 'resolver', options: [{ value: 'async', label: 'async resolver' }, { value: 'sync', label: 'sync resolver' }] },
     ],
-    code: () => [...WIRE, '// resolve() may be sync OR async', 'channel.trace(() => resolve(source, args), ctx)'],
+    code: () => [
+      ...WIRE,
+      'const out = channel.start.runStores(ctx,',
+      '  () => resolve(source, args))',
+      '',
+      'if (isThenable(out)) {              // async',
+      '  out.then(v => {',
+      '    ctx.result = v',
+      '    channel.asyncStart.publish(ctx)',
+      '    channel.asyncEnd.publish(ctx)',
+      '  })',
+      '} else {                           // sync',
+      '  ctx.result = out',
+      '  channel.end.publish(ctx)',
+      '}',
+    ],
     build: graphql,
   },
 ];
