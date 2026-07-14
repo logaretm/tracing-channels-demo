@@ -56,6 +56,7 @@ main {
   gap: 24px;
   align-items: start;
 }
+main > section { min-width: 0; }
 
 /* ---------- controls ---------- */
 .controls { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
@@ -118,7 +119,6 @@ main {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: 100%;
   text-align: left;
   font: inherit;
   background: var(--card);
